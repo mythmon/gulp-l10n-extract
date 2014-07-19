@@ -11,14 +11,21 @@ var gulpHeader = require('gulp-header');
 
 
 module.exports = function l10nExtract(domain) {
-  return streamCombiner.apply(null, [
-    es.through(parse),
-    es.through(walk),
-    es.through(filterCalls),
-    es.through(makePoFragments),
-    gulpConcat(domain + '.po'),
-    gulpHeader(poFileHeader),
-  ]);
+  return es.through(function(file) {
+    var poContents = walk(parse(file))
+      .filter(filterCalls)
+      .map(makePoFragment)
+      .reduce(function(memo, poFragment) {
+        return memo + '\n\n' + poFragment;
+      }, poFileHeader);
+
+    this.emit('data', new vinyl({
+      contents: new Buffer(poContents),
+      cwd: file.cwd,
+      base: file.base,
+      path: path.join(file.base, domain + '.po'),
+    }));
+  });
 };
 
 var poFileHeader = [
@@ -36,7 +43,6 @@ var poFileHeader = [
   '"Content-Transfer-Encoding: 8bit\\n"',
   '"X-Generator: Translate Toolkit 1.6.0\\n"',
   '"Plural-Forms: nplurals=2; plural=(n != 1);\\n"',
-  '',
 ].join('\n');
 
 function parse(file) {
@@ -45,41 +51,33 @@ function parse(file) {
     locations: true,
     sourceFile: file,
   });
-  this.emit('data', ast);
+  return ast;
 }
 
 function walk(ast) {
   var self = this;
+  var nodes = [];
   acornWalk.simple(ast, {
     CallExpression: function(node) {
-      self.emit('data', node);
+      nodes.push(node);
     },
   });
+  return nodes;
 }
 
 function filterCalls(callExpr) {
-  if (callExpr.callee.type === 'Identifier' &&
-      callExpr.callee.name === '_' &&
-      callExpr.arguments.length > 0 &&
-      callExpr.arguments[0].type === 'Literal') {
-
-    this.emit('data', callExpr);
-  }
+  return callExpr.callee.type === 'Identifier' &&
+         callExpr.callee.name === '_' &&
+         callExpr.arguments.length > 0 &&
+         callExpr.arguments[0].type === 'Literal';
 }
 
-function makePoFragments(callExpr) {
+function makePoFragment(callExpr) {
   var source = callExpr.loc.source;
   var msg = '"' + callExpr.arguments[0].value + '"';
   var filePath = path.relative(source.cwd, source.path);
   var poFragment = '#: ' + filePath + ':' + callExpr.loc.start.line + '\n';
   poFragment += 'msgid ' + msg + '\n';
   poFragment += 'msgstr ' + msg + '\n';
-
-  this.emit('data', new vinyl({
-    cwd: source.cwd,
-    base: source.base,
-    path: source.path,
-    relative: source.relative,
-    contents: new Buffer(poFragment),
-  }));
+  return poFragment;
 }
