@@ -1,31 +1,54 @@
 var path = require('path');
 
-var vinyl = require('vinyl');
 var acorn = require('acorn');
 var acornWalk = require('acorn/util/walk');
+var cheerio = require('cheerio');
 var es = require('event-stream');
 var streamCombiner = require('stream-combiner');
+var vinyl = require('vinyl');
 
 var gulpConcat = require('gulp-concat');
 var gulpHeader = require('gulp-header');
 
 
 module.exports = function l10nExtract(domain) {
-  return es.through(function(file) {
-    var poContents = walk(parse(file))
-      .filter(filterCalls)
-      .map(makePoFragment)
-      .reduce(function(memo, poFragment) {
+  var messages = [];
+  var cwd;
+  var base;
+
+  return es.through(
+    function onData(file) {
+      cwd = file.cwd;
+      base = file.base;
+
+      var match = file.path.match(/\.([^\.]*)$/);
+      if (match) {
+        var ext = match[1];
+        var extractor = extractors[ext];
+        if (extractor) {
+          messages = messages.concat(extractor(file));
+        } else {
+          this.emit('error', new Error('gulp-l10n-extract: Unknown file extension: ' + ext));
+        }
+      }
+    },
+    function onEnd() {
+      var poContents = messages.reduce(function(memo, poFragment) {
         return memo + '\n\n' + poFragment;
       }, poFileHeader);
 
-    this.emit('data', new vinyl({
-      contents: new Buffer(poContents),
-      cwd: file.cwd,
-      base: file.base,
-      path: path.join(file.base, domain + '.po'),
-    }));
+      this.emit('data', new vinyl({
+        contents: new Buffer(poContents),
+        cwd: cwd,
+        base: base,
+        path: path.join(base, domain + '.pot'),
+      }));
   });
+};
+
+var extractors = {
+  'js': extractJs,
+  'html': extractHtml,
 };
 
 var poFileHeader = [
@@ -45,39 +68,53 @@ var poFileHeader = [
   '"Plural-Forms: nplurals=2; plural=(n != 1);\\n"',
 ].join('\n');
 
-function parse(file) {
-  var code = file.contents.toString();
-  var ast = acorn.parse(code, {
-    locations: true,
-    sourceFile: file,
-  });
-  return ast;
+function extractJs(file) {
+  return walk(parse(file))
+    .filter(filterCalls)
+    .map(makePoFragment);
+
+  function parse(file) {
+    var code = file.contents.toString();
+    var ast = acorn.parse(code, {
+      locations: true,
+      sourceFile: file,
+    });
+    return ast;
+  }
+
+  function walk(ast) {
+    var self = this;
+    var nodes = [];
+    acornWalk.simple(ast, {
+      CallExpression: function(node) {
+        nodes.push(node);
+      },
+    });
+    return nodes;
+  }
+
+  function filterCalls(callExpr) {
+    return callExpr.callee.type === 'Identifier' &&
+           ['_', 'gettext'].indexOf(callExpr.callee.name) !== -1 &&
+           callExpr.arguments.length > 0 &&
+           callExpr.arguments[0].type === 'Literal';
+  }
+
+  function makePoFragment(callExpr) {
+    var source = callExpr.loc.source;
+    var msg = '"' + callExpr.arguments[0].value + '"';
+    var filePath = path.relative(source.cwd, source.path);
+
+    return [
+      '#: ' + filePath + ':' + callExpr.loc.start.line,
+      'msgid ' + msg,
+      'msgstr ""',
+    ].join('\n');
+  }
 }
 
-function walk(ast) {
-  var self = this;
-  var nodes = [];
-  acornWalk.simple(ast, {
-    CallExpression: function(node) {
-      nodes.push(node);
-    },
-  });
-  return nodes;
-}
-
-function filterCalls(callExpr) {
-  return callExpr.callee.type === 'Identifier' &&
-         callExpr.callee.name === '_' &&
-         callExpr.arguments.length > 0 &&
-         callExpr.arguments[0].type === 'Literal';
-}
-
-function makePoFragment(callExpr) {
-  var source = callExpr.loc.source;
-  var msg = '"' + callExpr.arguments[0].value + '"';
-  var filePath = path.relative(source.cwd, source.path);
-  var poFragment = '#: ' + filePath + ':' + callExpr.loc.start.line + '\n';
-  poFragment += 'msgid ' + msg + '\n';
-  poFragment += 'msgstr ' + msg + '\n';
-  return poFragment;
-}
+function extractHtml(file) {
+  var $ = cheerio.load(file.contents);
+  var elems = $('l10n, [l10n]');
+  return [];
+};
